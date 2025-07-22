@@ -1,3 +1,4 @@
+import dask.delayed
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -463,19 +464,19 @@ def analyze_earthquake_manifest(eq_time, eq_lon, eq_lat, radius_km,
     
     # Get station inventory
     client = Client(client_name)
-    print("Making inventory of stations...")
+    print("    Making inventory of stations...")
     inventory = client.get_stations(
         network=network, latitude=eq_lat, longitude=eq_lon,
         starttime=start_time, endtime=end_time, maxradius=radius_km/111.2,
         location=location, channel=channel, level="response"
     )
     
-    print("Filtering inventory...")
+    print("    Filtering inventory...")
     inventory = filter_inventory(inventory, eq_time, pre_time, post_time, 
                                client, network, location, channel, s3, BUCKET_NAME)
     
     stations = inventory[0].stations
-    print(f"Found {len(stations)} stations within {radius_km} km")
+    print(f"    Found {len(stations)} stations within {radius_km} km")
     
     manifest = []
 
@@ -491,7 +492,7 @@ def analyze_earthquake_manifest(eq_time, eq_lon, eq_lat, radius_km,
     # Filter out None results and build manifest
     manifest = [result for result in results if result is not None]
     
-    print(f"Successfully processed {len(manifest)} stations")
+    print(f"    Successfully processed {len(manifest)} stations")
     
     return manifest
 
@@ -512,14 +513,12 @@ class PhysicsInformedSeismicDataset(Dataset):
     """
     
     def __init__(self, manifest, window_size=5, target_length=None):
-        self.data = []
-        self.labels = []
         self.window_size = window_size
         
         # Initialize physics feature extractor
         self.feature_extractor = PhysicsInformedFeatures(sampling_rate=100)
         
-        # Determine target length
+        # Determine target length BEFORE parallel processing
         if target_length is None:
             if manifest:
                 sample_item = manifest[0]
@@ -532,7 +531,33 @@ class PhysicsInformedSeismicDataset(Dataset):
         else:
             self.target_length = target_length
         
+        # Process all waveforms in parallel using Dask
+        print(f"Processing {len(manifest)} waveforms in parallel...")
+        
+        # Create delayed tasks for each waveform
+        tasks = [
+            dask.delayed(self._process_waveform_standalone)(
+                item, window_size, self.target_length, self.feature_extractor.sampling_rate
+            ) for item in manifest
+        ]
+        
+        # Compute all tasks
+        results = dask.compute(*tasks, scheduler='threads')
+        
+        # Unpack successful results
+        self.data = []
+        self.labels = []
+        successful_loads = 0
+        for result in results:
+            if result is not None:
+                self.data.append(result['features'])
+                self.labels.append(result['label'])
+                successful_loads += 1
+        
+        print(f"Successfully loaded {successful_loads}/{len(manifest)} waveforms")
+
         # Process each waveform
+        '''
         successful_loads = 0
         for i, item in enumerate(manifest):
             try:
@@ -548,143 +573,129 @@ class PhysicsInformedSeismicDataset(Dataset):
                 continue
         
         print(f"Successfully loaded {successful_loads}/{len(manifest)} waveforms")
-    
-    def _process_waveform(self, item):
-        """Process individual waveform and extract features"""
-        # Load waveform from S3
-        bucket_name = item['bucket']
-        key_name = item['key']
-        pick_time = item['pick_time']
-        eq_time = item['eq_time']
-        pre_time = item['pre_time']
-        post_time = item['post_time']
+        '''
+    @staticmethod
+    def _process_waveform_standalone(item, window_size, target_length, default_sampling_rate):
+        """Standalone static method for Dask processing"""
+        # Create a new feature extractor for this task
+        feature_extractor = PhysicsInformedFeatures(sampling_rate=default_sampling_rate)
         
-        # Stream data
-        resp = s3.get_object(Bucket=bucket_name, Key=key_name)
-        buff = BytesIO(resp['Body'].read())
-        buff.seek(0)
-        
-        # Read waveform
-        st_stream = read(buff, format='MSEED')
-        st_stream.trim(starttime=eq_time - pre_time, endtime=eq_time + post_time)
-        
-        if len(st_stream) < 1:
-            return False
-        
-        waveform = st_stream[0]
-        sampling_rate = waveform.stats.sampling_rate
-        
-        # Calculate pick sample index
-        pick_offset = (pick_time - (eq_time - pre_time))
-        pick_sample = int(pick_offset * sampling_rate)
-        
-        # Normalize waveform length
-        waveform_norm, pick_sample_norm = self._normalize_waveform_length(
-            waveform.data, pick_sample
-        )
-        
-        # Extract physics-informed features
         try:
-            # Update feature extractor sampling rate
-            self.feature_extractor.sampling_rate = sampling_rate
-            physics_features = self.feature_extractor.compute_all_features(waveform_norm)
+            # Load waveform from S3
+            resp = s3.get_object(Bucket=item['bucket'], Key=item['key'])
+            buff = BytesIO(resp['Body'].read())
+            buff.seek(0)
             
-            print(f"Physics features shape: {physics_features.shape} for station {item['station']}")
+            # Read waveform
+            st_stream = read(buff, format='MSEED')
+            st_stream.trim(starttime=item['eq_time'] - item['pre_time'], 
+                        endtime=item['eq_time'] + item['post_time'])
+            
+            if len(st_stream) < 1:
+                return None
+            
+            waveform = st_stream[0]
+            sampling_rate = waveform.stats.sampling_rate
+            
+            # Calculate pick sample index
+            pick_offset = (item['pick_time'] - (item['eq_time'] - item['pre_time']))
+            pick_sample = int(pick_offset * sampling_rate)
+            
+            # Normalize waveform length
+            waveform_data = waveform.data
+            current_length = len(waveform_data)
+            
+            if current_length == target_length:
+                waveform_norm = waveform_data.copy()
+                pick_sample_norm = pick_sample
+            elif current_length > target_length:
+                # Truncate, keeping pick centered
+                excess = current_length - target_length
+                if pick_sample < target_length // 2:
+                    start_trim = max(0, excess // 4)
+                elif pick_sample > current_length - target_length // 2:
+                    start_trim = excess - max(0, excess // 4)
+                else:
+                    start_trim = excess // 2
+                
+                end_idx = start_trim + target_length
+                waveform_norm = waveform_data[start_trim:end_idx]
+                pick_sample_norm = pick_sample - start_trim
+            else:
+                # Pad with zeros
+                pad_needed = target_length - current_length
+                pad_start = pad_needed // 2
+                pad_end = pad_needed - pad_start
+                
+                waveform_norm = np.pad(waveform_data, (pad_start, pad_end), 
+                                    mode='constant', constant_values=0)
+                pick_sample_norm = pick_sample + pad_start
+            
+            # Extract physics-informed features
+            try:
+                # Update feature extractor sampling rate
+                feature_extractor.sampling_rate = sampling_rate
+                physics_features = feature_extractor.compute_all_features(waveform_norm)
+                
+                print(f"Physics features shape: {physics_features.shape} for station {item['station']}")
+                
+            except Exception as e:
+                print(f"Warning: Could not compute physics features for {item['station']}: {e}")
+                # Fallback to just raw waveform
+                physics_features = waveform_norm.reshape(1, -1)
+            
+            # Ensure features have correct length
+            if physics_features.shape[1] != target_length:
+                print(f"Warning: Feature length mismatch: {physics_features.shape[1]} vs {target_length}")
+                # Resize each feature channel to target length
+                resized_features = []
+                for i in range(physics_features.shape[0]):
+                    if physics_features.shape[1] > target_length:
+                        # Truncate
+                        excess = physics_features.shape[1] - target_length
+                        start_trim = excess // 2
+                        feature_trimmed = physics_features[i][start_trim:start_trim + target_length]
+                        resized_features.append(feature_trimmed)
+                    elif physics_features.shape[1] < target_length:
+                        # Pad
+                        pad_needed = target_length - physics_features.shape[1]
+                        pad_start = pad_needed // 2
+                        pad_end = pad_needed - pad_start
+                        feature_padded = np.pad(physics_features[i], (pad_start, pad_end), 
+                                            mode='constant', constant_values=0)
+                        resized_features.append(feature_padded)
+                    else:
+                        resized_features.append(physics_features[i])
+                
+                physics_features = np.array(resized_features)
+            
+            # Create labels
+            label = np.zeros(target_length)
+            
+            # Window around pick
+            window_samples = int(window_size * sampling_rate / 2)
+            pick_sample_norm = np.clip(pick_sample_norm, 0, target_length - 1)
+            
+            start_idx = max(0, pick_sample_norm - window_samples)
+            end_idx = min(target_length, pick_sample_norm + window_samples)
+            label[start_idx:end_idx] = 1
+            
+            return {
+                'features': physics_features.astype(np.float32),
+                'label': label.astype(np.int64)
+            }
             
         except Exception as e:
-            print(f"Warning: Could not compute physics features for {item['station']}: {e}")
-            # Fallback to just raw waveform
-            physics_features = waveform_norm.reshape(1, -1)
+            print(f"Error processing waveform: {e}")
+            return None
         
-        # Ensure features have correct length
-        if physics_features.shape[1] != self.target_length:
-            print(f"Warning: Feature length mismatch: {physics_features.shape[1]} vs {self.target_length}")
-            # Resize each feature channel to target length
-            resized_features = []
-            for i in range(physics_features.shape[0]):
-                if physics_features.shape[1] > self.target_length:
-                    # Truncate
-                    excess = physics_features.shape[1] - self.target_length
-                    start_trim = excess // 2
-                    feature_trimmed = physics_features[i][start_trim:start_trim + self.target_length]
-                    resized_features.append(feature_trimmed)
-                elif physics_features.shape[1] < self.target_length:
-                    # Pad
-                    pad_needed = self.target_length - physics_features.shape[1]
-                    pad_start = pad_needed // 2
-                    pad_end = pad_needed - pad_start
-                    feature_padded = np.pad(physics_features[i], (pad_start, pad_end), 
-                                          mode='constant', constant_values=0)
-                    resized_features.append(feature_padded)
-                else:
-                    resized_features.append(physics_features[i])
-            
-            physics_features = np.array(resized_features)
-            
-        # Create labels
-        label = self._create_label(pick_sample_norm, sampling_rate)
-        
-        # Store processed data
-        self.data.append(physics_features.astype(np.float32))
-        self.labels.append(label.astype(np.int64))
-        
-        return True
-    
-    def _normalize_waveform_length(self, waveform, pick_sample):
-        """Normalize waveform to target length"""
-        current_length = len(waveform)
-        
-        if current_length == self.target_length:
-            return waveform.copy(), pick_sample
-        
-        elif current_length > self.target_length:
-            # Truncate, keeping pick centered
-            excess = current_length - self.target_length
-            if pick_sample < self.target_length // 2:
-                start_trim = max(0, excess // 4)
-            elif pick_sample > current_length - self.target_length // 2:
-                start_trim = excess - max(0, excess // 4)
-            else:
-                start_trim = excess // 2
-            
-            end_idx = start_trim + self.target_length
-            normalized_waveform = waveform[start_trim:end_idx]
-            normalized_pick = pick_sample - start_trim
-            
-        else:
-            # Pad with zeros
-            pad_needed = self.target_length - current_length
-            pad_start = pad_needed // 2
-            pad_end = pad_needed - pad_start
-            
-            normalized_waveform = np.pad(waveform, (pad_start, pad_end), 
-                                       mode='constant', constant_values=0)
-            normalized_pick = pick_sample + pad_start
-        
-        return normalized_waveform, normalized_pick
-    
-    def _create_label(self, pick_sample, sampling_rate):
-        """Create binary label for P-wave detection"""
-        label = np.zeros(self.target_length)
-        
-        # Window around pick
-        window_samples = int(self.window_size * sampling_rate / 2)
-        pick_sample = np.clip(pick_sample, 0, self.target_length - 1)
-        
-        start_idx = max(0, pick_sample - window_samples)
-        end_idx = min(self.target_length, pick_sample + window_samples)
-        label[start_idx:end_idx] = 1
-        
-        return label
-    
     def __len__(self):
-        return len(self.data)
+        return len(self.data) if hasattr(self, 'data') else 0
     
     def __getitem__(self, idx):
         features = torch.FloatTensor(self.data[idx])
         label = torch.LongTensor(self.labels[idx])
         return features, label
-
 # ═══════════════════════════════════════════════════════════════════════════════════════
 # 🏗️ TRAINING AND EVALUATION
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -888,7 +899,7 @@ def visualize_physics_features(dataset, sample_idx=0, save_path='physics_feature
     plt.show()
     print(f"Physics features visualization saved to {save_path}")
 
-def plot_model_predictions(model, dataset, manifest, num_examples=3, save_path='model_predictions.png'):
+def plot_model_predictions(model, dataset, manifest, num_examples=2, save_path='model_predictions.png'):
     """Plot model predictions with physics features"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -1003,7 +1014,7 @@ def main():
     """Main execution function"""
     
     print("="*80)
-    print("🌊 PHYSICS-INFORMED SEISMIC PHASE PICKER")
+    print("PHYSICS-INFORMED SEISMIC PHASE PICKER")
     print("="*80)
     
     # Example earthquakes
@@ -1016,12 +1027,14 @@ def main():
     ]
     
     # Collect data from multiple earthquakes
-    print("\n📊 COLLECTING DATA FROM EARTHQUAKES")
-    print("-" * 50)
-    
+    print('\n')
+    print("-" * 25)
+    print("DATA MINING")
+    print("-" * 25)
+
     all_manifest = []
     for eq in earthquakes:
-        print(f"\nProcessing earthquake: {eq['time']}")
+        print(f"\n  Processing earthquake: {eq['time']}")
         try:
             manifest = analyze_earthquake_manifest(
                 eq_time=eq['time'],
@@ -1030,60 +1043,74 @@ def main():
                 radius_km=eq['radius']
             )
             all_manifest.extend(manifest)
-            print(f"✅ Collected {len(manifest)} stations for this earthquake")
+            print(f"    ✅ Collected {len(manifest)} stations for this earthquake")
         except Exception as e:
-            print(f"❌ Error processing earthquake {eq['time']}: {e}")
+            print(f"    ❌ Error processing earthquake {eq['time']}: {e}")
     
-    print(f"\n📈 Total stations collected: {len(all_manifest)}")
+    print(f"\nTotal stations collected: {len(all_manifest)}")
     
     if len(all_manifest) == 0:
         print("❌ No data collected. Exiting.")
         return
     
     # Split data
-    print("\n🔀 SPLITTING DATA")
-    print("-" * 50)
-    
+    print('\n')
+    print("-" * 25)
+    print("DATA SPLITTING")
+    print("-" * 25)
+
     train_manifest, val_manifest = train_test_split(all_manifest, test_size=0.2, random_state=42)
-    print(f"Training samples: {len(train_manifest)}")
-    print(f"Validation samples: {len(val_manifest)}")
+    print(f"    Training samples: {len(train_manifest)}")
+    print(f"    Validation samples: {len(val_manifest)}")
     
     # Create datasets with physics-informed features
-    print("\n🧪 CREATING PHYSICS-INFORMED DATASETS")
+    print('\n')
     print("-" * 50)
-    
-    print("Creating training dataset...")
+    print("CREATING PHYSICS-INFORMED DATASETS")
+    print("-" * 50)
+
+    print("    Creating training dataset...")
     train_dataset = PhysicsInformedSeismicDataset(train_manifest, window_size=5)
-    
-    print("Creating validation dataset...")
+
+    print("    Creating validation dataset...")
     val_dataset = PhysicsInformedSeismicDataset(val_manifest, window_size=5)
-    
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        print("❌ Failed to create datasets. Exiting.")
+
+    # Check if datasets were created successfully
+    if not hasattr(train_dataset, 'data') or len(train_dataset.data) == 0:
+        print("❌ Failed to create training dataset. No data loaded.")
         return
-    
+
+    if not hasattr(val_dataset, 'data') or len(val_dataset.data) == 0:
+        print("❌ Failed to create validation dataset. No data loaded.")
+        return
+
+    print(f"    ✅ Training dataset size: {len(train_dataset)}")
+    print(f"    ✅ Validation dataset size: {len(val_dataset)}")
+
     # Visualize physics features for first sample
-    print("\n📊 VISUALIZING PHYSICS FEATURES")
-    print("-" * 50)
+    #print("\n📊 VISUALIZING PHYSICS FEATURES")
+    #print("-" * 50)
     
-    if len(train_dataset) > 0:
-        visualize_physics_features(train_dataset, sample_idx=0)
-    else:
-        print("❌ No training data available for visualization")
+    #if len(train_dataset) > 0:
+    #    visualize_physics_features(train_dataset, sample_idx=0)
+    #else:
+    #    print("❌ No training data available for visualization")
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
     
     # Initialize physics-informed model
-    print("\n🤖 INITIALIZING PHYSICS-INFORMED MODEL")
+    print('\n')
+    print("-" * 50)
+    print("INITIALIZING PHYSICS-INFORMED MODEL")
     print("-" * 50)
     
     # Get number of input channels from first sample
     sample_features, _ = train_dataset[0]
     n_input_channels = sample_features.shape[0]
-    print(f"✅ Input channels (features): {n_input_channels}")
-    print(f"✅ Feature shape: {sample_features.shape}")
+    print(f"\n     ✅ Input channels (features): {n_input_channels}")
+    print(f"\n     ✅ Feature shape: {sample_features.shape}")
     
     model = PhysicsInformedUNet1D(in_channels=n_input_channels, out_channels=2)
     
@@ -1093,14 +1120,16 @@ def main():
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"        Total parameters: {total_params:,}")
+    print(f"        Trainable parameters: {trainable_params:,}")
     
     # Print feature weights
-    print(f"Learnable feature weights: {model.feature_weights.data}")
+    print(f"        Learnable feature weights: {model.feature_weights.data}")
     
     # Train model
-    print("\n🚀 STARTING TRAINING")
+    print('\n')
+    print("-" * 50)
+    print("🚀 STARTING TRAINING")
     print("-" * 50)
     
     train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=25)
@@ -1174,7 +1203,7 @@ def main():
     plt.show()
     
     # Plot model predictions
-    plot_model_predictions(model, val_dataset, val_manifest, num_examples=3)
+    plot_model_predictions(model, val_dataset, val_manifest, num_examples=2)
     
     # Print final feature weights
     print(f"\n🎛️ Final learned feature weights:")
