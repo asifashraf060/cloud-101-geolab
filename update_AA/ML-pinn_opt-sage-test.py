@@ -168,6 +168,23 @@ class PhysicsInformedFeatures:
         
         return all_features
 
+class ShiftGradientFeature:
+    @staticmethod
+    def compute(waveform: np.ndarray, target_length: int) -> np.ndarray:
+        # 1) shift negatives up
+        shifted = waveform - waveform.min()
+        # 2) gradient (current – previous)
+        grad = np.diff(shifted, prepend=shifted[0])
+        # 3) resize to target_length (use the same pad‐or‐truncate logic you already have)
+        if len(grad) > target_length:
+            # truncate center
+            start = (len(grad) - target_length) // 2
+            grad = grad[start:start+target_length]
+        elif len(grad) < target_length:
+            # pad at end
+            grad = np.pad(grad, (0, target_length-len(grad)), 'constant')
+        return grad.reshape(1, -1)
+
 # ═══════════════════════════════════════════════════════════════════════════════════════
 # 🏗️ ENHANCED U-NET ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -432,7 +449,7 @@ def process_stations(station, start_time, pre_time, post_time, eq_time,
         tr = st_stream[0]
         
         # Remove instrument response
-        tr.remove_response(inventory=inventory, output="DISP")
+        tr.remove_response(inventory=inventory, output="DISP", zero_mean = True)
         
         # Get PhaseNet picks for reference
         picks = picker.classify(st_stream, batch_size=256, P_threshold=0.075, S_threshold=0.1).picks
@@ -445,13 +462,12 @@ def process_stations(station, start_time, pre_time, post_time, eq_time,
         
         # Return the station data
         return {
-            'bucket': BUCKET_NAME,
-            'key': key,
             'pick_time': p_time,
             'pre_time': pre_time,
             'post_time': post_time,
             'eq_time': eq_time,
             'station': station_code,
+            'waveform': tr,
             'sampling_rate': tr.stats.sampling_rate
         }
         
@@ -461,7 +477,7 @@ def process_stations(station, start_time, pre_time, post_time, eq_time,
 
 def analyze_earthquake_manifest(eq_time, eq_lon, eq_lat, radius_km,
                                client_name='NCEDC', network='NC', location='*', 
-                               channel='HNE', pre_time=3, post_time=120):
+                               channel='HNE', pre_time=3, post_time=120, output_dir='plots/dask'):
     """Analyze earthquake and build station manifest"""
     
     if not isinstance(eq_time, UTCDateTime):
@@ -515,15 +531,16 @@ class AdaptiveSeismicDataset(Dataset):
     │ Adaptive Seismic Dataset                                                             │
     │ ──────────────────────────────────────────────────────────────────────────────────── │
     │ • Loads raw seismic waveforms                                                        │
-    │ • Optionally computes physics-informed features (STA/LTA, envelope, spectral)       │
+    │ • Optionally computes physics-informed features (STA/LTA, envelope, spectral)        │
     │ • Creates single or multi-channel input based on configuration                       │
     │ • Generates labels for P-wave detection                                              │
     └──────────────────────────────────────────────────────────────────────────────────────┘
     """
     
-    def __init__(self, manifest, window_size=5, target_length=None, use_physics_features=True):
+    def __init__(self, manifest, window_size=5, target_length=None, use_physics_features=True, use_shift_gradient=True):
         self.window_size = window_size
         self.use_physics_features = use_physics_features
+        self.use_shift_gradient = use_shift_gradient
         
         # Initialize physics feature extractor only if needed
         if self.use_physics_features:
@@ -551,7 +568,7 @@ class AdaptiveSeismicDataset(Dataset):
         # Create delayed tasks for each waveform
         tasks = [
             dask.delayed(self._process_waveform_standalone)(
-                item, window_size, self.target_length, use_physics_features
+                item, window_size, self.target_length, use_physics_features, use_shift_gradient
             ) for item in manifest
         ]
         
@@ -571,24 +588,12 @@ class AdaptiveSeismicDataset(Dataset):
         print(f"Successfully loaded {successful_loads}/{len(manifest)} waveforms")
     
     @staticmethod
-    def _process_waveform_standalone(item, window_size, target_length, use_physics_features):
+    def _process_waveform_standalone(item, window_size, target_length, use_physics_features, use_shift_gradient):
         """Standalone static method for Dask processing"""
         
         try:
-            # Load waveform from S3
-            resp = s3.get_object(Bucket=item['bucket'], Key=item['key'])
-            buff = BytesIO(resp['Body'].read())
-            buff.seek(0)
-            
-            # Read waveform
-            st_stream = read(buff, format='MSEED')
-            st_stream.trim(starttime=item['eq_time'] - item['pre_time'], 
-                        endtime=item['eq_time'] + item['post_time'])
-            
-            if len(st_stream) < 1:
-                return None
-            
-            waveform = st_stream[0]
+            waveform = item['waveform']
+
             sampling_rate = waveform.stats.sampling_rate
             
             # Calculate pick sample index
@@ -603,6 +608,18 @@ class AdaptiveSeismicDataset(Dataset):
                 waveform_norm = waveform_data.copy()
                 pick_sample_norm = pick_sample
             elif current_length > target_length:
+                # Truncate so the pick falls at one-third of the window
+                desired_pick_idx = target_length // 3
+                start_trim = pick_sample - desired_pick_idx
+                # Clamp to valid range
+                if start_trim < 0:
+                    start_trim = 0
+                if start_trim + target_length > current_length:
+                    start_trim = current_length - target_length
+                end_idx = start_trim + target_length
+                waveform_norm = waveform_data[start_trim:end_idx]
+                pick_sample_norm = pick_sample - start_trim
+                '''
                 # Truncate, keeping pick centered
                 excess = current_length - target_length
                 if pick_sample < target_length // 2:
@@ -615,7 +632,18 @@ class AdaptiveSeismicDataset(Dataset):
                 end_idx = start_trim + target_length
                 waveform_norm = waveform_data[start_trim:end_idx]
                 pick_sample_norm = pick_sample - start_trim
+                '''
             else:
+                # Pad with zeros at the end only
+                pad_needed = target_length - current_length
+                waveform_norm = np.pad(
+                    waveform_data,
+                    (0, pad_needed),
+                    mode='constant',
+                    constant_values=0
+                )
+                pick_sample_norm = pick_sample
+                '''
                 # Pad with zeros
                 pad_needed = target_length - current_length
                 pad_start = pad_needed // 2
@@ -624,7 +652,7 @@ class AdaptiveSeismicDataset(Dataset):
                 waveform_norm = np.pad(waveform_data, (pad_start, pad_end), 
                                     mode='constant', constant_values=0)
                 pick_sample_norm = pick_sample + pad_start
-            
+                '''
             # Prepare features based on configuration
             if use_physics_features:
                 # Extract physics-informed features
@@ -645,11 +673,33 @@ class AdaptiveSeismicDataset(Dataset):
                 # Use only raw waveform (single channel)
                 final_features = waveform_norm.reshape(1, -1)
                 print(f"Raw waveform shape: {final_features.shape} for station {item['station']}")
-            
+
+            if use_shift_gradient:
+                sg_feat = ShiftGradientFeature.compute(waveform_norm, target_length)
+                final_features = np.vstack([physics_features, sg_feat])
+
+
             # Ensure features have correct length
             if final_features.shape[1] != target_length:
                 print(f"Warning: Feature length mismatch: {final_features.shape[1]} vs {target_length}")
                 # Resize each feature channel to target length
+                resized = []
+                for ch in final_features:
+                    length = len(ch)
+                    if length > target_length:
+                        # center-truncate fallback
+                        excess = length - target_length
+                        start = excess // 2
+                        resized.append(ch[start:start + target_length])
+                    elif length < target_length:
+                        # pad at end only
+                        pad = target_length - length
+                        resized.append(np.pad(ch, (0, pad), mode='constant', constant_values=0))
+                    else:
+                        resized.append(ch)
+                final_features = np.vstack(resized)
+
+                '''
                 resized_features = []
                 for i in range(final_features.shape[0]):
                     if final_features.shape[1] > target_length:
@@ -668,14 +718,14 @@ class AdaptiveSeismicDataset(Dataset):
                         resized_features.append(feature_padded)
                     else:
                         resized_features.append(final_features[i])
-                
                 final_features = np.array(resized_features)
+                '''
             
             # Create labels
             label = np.zeros(target_length)
             
             # Window around pick
-            window_samples = int(window_size * sampling_rate / 2)
+            window_samples = int(window_size * sampling_rate / 6)
             pick_sample_norm = np.clip(pick_sample_norm, 0, target_length - 1)
             
             start_idx = max(0, pick_sample_norm - window_samples)
@@ -1038,7 +1088,7 @@ def plot_model_predictions(model, dataset, manifest, num_examples=2, save_path='
 # 🏗️ MAIN EXECUTION WITH CONFIGURABLE PHYSICS FEATURES
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
-def main(use_physics_features=True, num_epochs=25):
+def main(use_physics_features=True, use_shift_gradient=True, num_epochs=25):
     """
     Main execution function with configurable physics features
     
@@ -1060,8 +1110,11 @@ def main(use_physics_features=True, num_epochs=25):
     
     # Example earthquakes
     earthquakes = [
-        {"time": '2022-12-20T10:34:24', "lat": 40.369, "lon": -124.588, "radius": 100},  # Ferndale
-        {"time": "2010-01-10T00:27:39", "lat": 40.652, "lon": -124.693, "radius": 100},  # Eureka
+        {"time": '2022-12-20T10:34:24', "lat": 40.369, "lon": -124.588, "radius": 250},  # Ferndale
+        {"time": "2010-01-10T00:27:39", "lat": 40.652, "lon": -124.693, "radius": 250},  # Eureka
+        {"time": "2021-12-20T20:10:31", "lat": 40.390, "lon": -124.298, "radius": 250},  # Petrolia
+        {"time": "2021-07-08T22:49:48", "lat": 38.508, "lon": -119.500, "radius": 250},  # Antelope
+        {"time": "2020-04-11 14:36:37", "lat": 38.053, "lon": -118.733, "radius": 250},  # Bodie
     ]
     
     # Collect data from multiple earthquakes
@@ -1075,11 +1128,11 @@ def main(use_physics_features=True, num_epochs=25):
         print(f"\n  Processing earthquake: {eq['time']}")
         try:
             manifest = analyze_earthquake_manifest(
-                eq_time=eq['time'],
-                eq_lat=eq['lat'],
-                eq_lon=eq['lon'],
-                radius_km=eq['radius']
-            )
+                            eq_time=eq['time'],
+                            eq_lat=eq['lat'],
+                            eq_lon=eq['lon'],
+                            radius_km=eq['radius']
+                        )
             all_manifest.extend(manifest)
             print(f"    ✅ Collected {len(manifest)} stations for this earthquake")
         except Exception as e:
@@ -1109,11 +1162,13 @@ def main(use_physics_features=True, num_epochs=25):
 
     print("    Creating training dataset...")
     train_dataset = AdaptiveSeismicDataset(train_manifest, window_size=5, 
-                                         use_physics_features=use_physics_features)
+                                         use_physics_features=use_physics_features, 
+                                         use_shift_gradient=use_shift_gradient)
 
     print("    Creating validation dataset...")
     val_dataset = AdaptiveSeismicDataset(val_manifest, window_size=5, 
-                                       use_physics_features=use_physics_features)
+                                       use_physics_features=use_physics_features, 
+                                       use_shift_gradient=use_shift_gradient)
 
     # Check if datasets were created successfully
     if not hasattr(train_dataset, 'data') or len(train_dataset.data) == 0:
@@ -1156,7 +1211,7 @@ def main(use_physics_features=True, num_epochs=25):
     
     model = AdaptiveUNet1D(in_channels=n_input_channels, out_channels=2,
                           use_physics_features=use_physics_features)
-    
+
     # Initialize feature weights with correct dimensions (only if using physics features)
     if use_physics_features:
         model.initialize_feature_weights(n_input_channels)
@@ -1280,12 +1335,16 @@ if __name__ == "__main__":
     # Toggle physics-informed features ON/OFF
     USE_PHYSICS_FEATURES = True   # Set to False for raw waveform only
     
+    # Toggle shift gradient feature ON/OFF
+    USE_SHIFT_GRADIENT = True  # Set to False to disable shift gradient feature
+
     # Set number of training epochs
     TRAINING_EPOCHS = 25
     
     # Run the main function with your configuration
-    main(use_physics_features=USE_PHYSICS_FEATURES, num_epochs=TRAINING_EPOCHS)
-    
+    main(use_physics_features=USE_PHYSICS_FEATURES, use_shift_gradient=USE_SHIFT_GRADIENT, 
+         num_epochs=TRAINING_EPOCHS)
+
     # ═══════════════════════════════════════════════════════════════════════════════════════
     # 🔄 EXAMPLE: Run both modes for comparison (uncomment to use)
     # ═══════════════════════════════════════════════════════════════════════════════════════
